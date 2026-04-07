@@ -77,6 +77,10 @@ void menu_advanced_settings();
   void menu_delta_calibrate();
 #endif
 
+#if ENABLED(MKS_WIFI_MODULE)
+  void menu_wifi();
+#endif
+
 #if ENABLED(LCD_PROGRESS_BAR_TEST)
 
   static void progress_bar_test() {
@@ -573,6 +577,10 @@ void menu_configuration() {
   #endif
 
   SUBMENU(MSG_ADVANCED_SETTINGS, menu_advanced_settings);
+
+  #if ENABLED(MKS_WIFI_MODULE)
+    SUBMENU_F(F("Wi-Fi"), menu_wifi);
+  #endif
 
   #if ENABLED(BABYSTEP_ZPROBE_OFFSET)
     SUBMENU(MSG_ZPROBE_ZOFFSET, lcd_babystep_zoffset);

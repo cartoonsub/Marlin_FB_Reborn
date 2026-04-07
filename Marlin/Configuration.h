@@ -655,7 +655,7 @@
 // Above this temperature the heater will be switched off.
 // This can protect components from overheating, but NOT from shorts and failures.
 // (Use MINTEMP for thermistor short/failure protection.)
-#define HEATER_0_MAXTEMP 300
+#define HEATER_0_MAXTEMP 270
 #define HEATER_1_MAXTEMP 275
 #define HEATER_2_MAXTEMP 275
 #define HEATER_3_MAXTEMP 275
@@ -3491,7 +3491,7 @@ EEPROM_W25Q
   #endif
 #endif
 
-//#define MKS_WIFI_MODULE  // MKS WiFi module
+#define MKS_WIFI_MODULE  // MKS WiFi module
 
 //
 // RepRapWorld REPRAPWORLD_KEYPAD v1.1

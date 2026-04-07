@@ -19,6 +19,10 @@ void mks_wifi_init(void){
 
 	memset(&mks_wifi_info, 0, sizeof(mks_wifi_info));
 	
+	// Initialize state machine
+	mks_wifi_info.state = WIFI_STATE_IDLE;
+	mks_wifi_info.show_status_once = 0;
+	
 	SET_OUTPUT(MKS_WIFI_IO0);
 	WRITE(MKS_WIFI_IO0, HIGH);
 
@@ -398,4 +402,186 @@ void mks_wifi_send(uint8_t *packet, uint16_t size){
 // 	}
 // 	return;
 // };
+
+//
+// --- Wi-Fi Menu Management API Implementation ---
+//
+
+uint8_t mks_wifi_get_state(void) {
+	return mks_wifi_info.state;
+}
+
+bool mks_wifi_is_connected(void) {
+	return mks_wifi_info.connected;
+}
+
+bool mks_wifi_has_ip(void) {
+	// Check if IP is not 0.0.0.0
+	return (mks_wifi_info.ip[0] != 0 || mks_wifi_info.ip[1] != 0 || 
+	        mks_wifi_info.ip[2] != 0 || mks_wifi_info.ip[3] != 0);
+}
+
+void mks_wifi_get_ip_string(char *buffer, uint8_t size) {
+	if (buffer && size >= 16) {
+		sprintf(buffer, "%d.%d.%d.%d", 
+		        mks_wifi_info.ip[0], mks_wifi_info.ip[1],
+		        mks_wifi_info.ip[2], mks_wifi_info.ip[3]);
+	}
+}
+
+void mks_wifi_get_current_ssid(char *buffer, uint8_t size) {
+	if (buffer && size > 0) {
+		strncpy(buffer, mks_wifi_info.net_name, size - 1);
+		buffer[size - 1] = '\0';
+	}
+}
+
+uint8_t mks_wifi_get_mode(void) {
+	return mks_wifi_info.mode;
+}
+
+void mks_wifi_request_scan(void) {
+	uint32_t packet_size;
+	ESP_PROTOC_FRAME esp_frame;
+	
+	// Prepare scan request frame (type: request scan)
+	// Command format: type=0x05 (custom scan request)
+	mks_out_buffer[0] = 0x05; // Scan request command
+	
+	esp_frame.type = ESP_TYPE_NET; // Use NET type for control commands
+	esp_frame.dataLen = 1;
+	esp_frame.data = mks_out_buffer;
+	packet_size = mks_wifi_build_packet((uint8_t *)esp_packet, &esp_frame);
+	
+	if (packet_size > 0) {
+		mks_wifi_send((uint8_t *)esp_packet, packet_size);
+		mks_wifi_info.state = WIFI_STATE_SCANNING;
+		DEBUG("WiFi scan requested");
+	}
+}
+
+bool mks_wifi_has_scan_results(void) {
+	return (mks_wifi_info.scan_count > 0);
+}
+
+uint8_t mks_wifi_get_scan_count(void) {
+	return mks_wifi_info.scan_count;
+}
+
+void mks_wifi_get_scan_ssid(uint8_t index, char *buffer, uint8_t size) {
+	if (index < mks_wifi_info.scan_count && buffer && size > 0) {
+		strncpy(buffer, mks_wifi_info.scan_results[index].ssid, size - 1);
+		buffer[size - 1] = '\0';
+	}
+}
+
+int8_t mks_wifi_get_scan_rssi(uint8_t index) {
+	if (index < mks_wifi_info.scan_count) {
+		return mks_wifi_info.scan_results[index].rssi;
+	}
+	return -100;
+}
+
+void mks_wifi_set_ssid(const char *ssid) {
+	if (ssid) {
+		strncpy(mks_wifi_info.ssid_buf, ssid, WIFI_SSID_MAX_LEN - 1);
+		mks_wifi_info.ssid_buf[WIFI_SSID_MAX_LEN - 1] = '\0';
+		DEBUG("SSID set: %s", mks_wifi_info.ssid_buf);
+	}
+}
+
+void mks_wifi_set_password(const char *password) {
+	if (password) {
+		strncpy(mks_wifi_info.pass_buf, password, WIFI_PASS_MAX_LEN - 1);
+		mks_wifi_info.pass_buf[WIFI_PASS_MAX_LEN - 1] = '\0';
+		DEBUG("Password set (length: %d)", strlen(mks_wifi_info.pass_buf));
+	}
+}
+
+void mks_wifi_get_ssid_buffer(char *buffer, uint8_t size) {
+	if (buffer && size > 0) {
+		strncpy(buffer, mks_wifi_info.ssid_buf, size - 1);
+		buffer[size - 1] = '\0';
+	}
+}
+
+void mks_wifi_get_password_buffer(char *buffer, uint8_t size) {
+	if (buffer && size > 0) {
+		strncpy(buffer, mks_wifi_info.pass_buf, size - 1);
+		buffer[size - 1] = '\0';
+	}
+}
+
+void mks_wifi_connect(void) {
+	uint32_t packet_size;
+	ESP_PROTOC_FRAME esp_frame;
+	
+	memset(mks_out_buffer, 0, MKS_OUT_BUFF_SIZE);
+	
+	uint32_t ssid_len = strlen(mks_wifi_info.ssid_buf);
+	uint32_t pass_len = strlen(mks_wifi_info.pass_buf);
+	
+	if (ssid_len == 0 || ssid_len > WIFI_SSID_MAX_LEN - 1) {
+		DEBUG("Invalid SSID length");
+		mks_wifi_info.state = WIFI_STATE_CONNECT_FAILED;
+		return;
+	}
+	
+	// Build connection packet
+	// Format: [mode(1)] [ssid_len(1)] [ssid(ssid_len)] [pass_len(1)] [pass(pass_len)]
+	mks_out_buffer[0] = WIFI_MODE_STA; // Station mode
+	mks_out_buffer[1] = ssid_len;
+	memcpy(&mks_out_buffer[2], mks_wifi_info.ssid_buf, ssid_len);
+	mks_out_buffer[2 + ssid_len] = pass_len;
+	memcpy(&mks_out_buffer[2 + ssid_len + 1], mks_wifi_info.pass_buf, pass_len);
+	
+	esp_frame.type = ESP_TYPE_NET;
+	esp_frame.dataLen = 3 + ssid_len + pass_len;
+	esp_frame.data = mks_out_buffer;
+	packet_size = mks_wifi_build_packet((uint8_t *)esp_packet, &esp_frame);
+	
+	if (packet_size > 0) {
+		mks_wifi_send((uint8_t *)esp_packet, packet_size);
+		mks_wifi_info.state = WIFI_STATE_CONNECTING;
+		mks_wifi_info.connecting_timeout = 30; // 30 second timeout
+		DEBUG("WiFi connect requested for SSID: %s", mks_wifi_info.ssid_buf);
+	}
+}
+
+void mks_wifi_reconnect(void) {
+	uint32_t packet_size;
+	ESP_PROTOC_FRAME esp_frame;
+	
+	// Send reconnect command 
+	mks_out_buffer[0] = 0x06; // Reconnect command
+	
+	esp_frame.type = ESP_TYPE_NET;
+	esp_frame.dataLen = 1;
+	esp_frame.data = mks_out_buffer;
+	packet_size = mks_wifi_build_packet((uint8_t *)esp_packet, &esp_frame);
+	
+	if (packet_size > 0) {
+		mks_wifi_send((uint8_t *)esp_packet, packet_size);
+		mks_wifi_info.state = WIFI_STATE_CONNECTING;
+		mks_wifi_info.connecting_timeout = 30;
+		DEBUG("WiFi reconnect requested");
+	}
+}
+
+//
+// Main loop handler for Wi-Fi
+//
+void wifi_looping(void) {
+	// Handle Wi-Fi state transitions and timeouts
+	if (mks_wifi_info.state == WIFI_STATE_CONNECTING && mks_wifi_info.connecting_timeout > 0) {
+		mks_wifi_info.connecting_timeout--;
+		if (mks_wifi_info.connecting_timeout == 0) {
+			// Connection timeout - check status
+			DEBUG("WiFi connection timeout");
+		}
+	}
+	
+	// Additional Wi-Fi processing can be added here
+	// For now, this is a placeholder for future enhancements
+}
 
