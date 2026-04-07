@@ -72,7 +72,11 @@ typedef struct {
 	char		pass_buf[WIFI_PASS_MAX_LEN];
 	WIFI_SCAN_RESULT	scan_results[WIFI_MAX_SCAN_NETWORKS];
 	uint8_t		scan_count;
-	uint8_t		connecting_timeout;
+	uint32_t	connecting_start_time;	// millis() timestamp when connection started
+	// State flags
+	uint8_t		scanning_in_progress;
+	uint8_t		connect_needed;
+	uint8_t		scan_results_updated;
 } MKS_WIFI_INFO;
 
 extern MKS_WIFI_INFO mks_wifi_info;
@@ -112,14 +116,13 @@ int8_t mks_wifi_get_scan_rssi(uint8_t index);
 // Credentials management
 void mks_wifi_set_ssid(const char *ssid);
 void mks_wifi_set_password(const char *password);
+void mks_wifi_set_credentials(const char *ssid, const char *password);
 void mks_wifi_get_ssid_buffer(char *buffer, uint8_t size);
 void mks_wifi_get_password_buffer(char *buffer, uint8_t size);
 
 // Connection management
 void mks_wifi_connect(void);
 void mks_wifi_reconnect(void);
-
-// Main loop handler
 void wifi_looping(void);
 
 #endif

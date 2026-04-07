@@ -22,6 +22,9 @@ void mks_wifi_init(void){
 	// Initialize state machine
 	mks_wifi_info.state = WIFI_STATE_IDLE;
 	mks_wifi_info.show_status_once = 0;
+	mks_wifi_info.scanning_in_progress = 0;
+	mks_wifi_info.connect_needed = 0;
+	mks_wifi_info.scan_results_updated = 0;
 	
 	SET_OUTPUT(MKS_WIFI_IO0);
 	WRITE(MKS_WIFI_IO0, HIGH);
@@ -273,7 +276,13 @@ void mks_wifi_parse_packet(ESP_PROTOC_FRAME *packet){
 	char str[100];
 
 	switch(packet->type){
-		case ESP_TYPE_NET:
+		case ESP_TYPE_NET: {
+			// Validate minimum packet size: IP(4) + reserved(2) + status(1) + mode(1) + ssid_len(1) = 9 bytes minimum
+			if (packet->dataLen < 9) {
+				DEBUG("[NET] Packet too short: %d bytes", packet->dataLen);
+				break;
+			}
+			
 			memset(str,0,100);
 			if(packet->data[6] == ESP_NET_WIFI_CONNECTED){
 				if(show_ip_once==0){
@@ -283,32 +292,62 @@ void mks_wifi_parse_packet(ESP_PROTOC_FRAME *packet){
 					SERIAL_ECHO_START();
 					SERIAL_ECHOLN((char*)str);	
 
-					//Вывод имени сети
-					
-					if(packet->data[8] < 100){
-						memcpy(str,&packet->data[9],packet->data[8]); 
-						str[packet->data[8]]=0;
-						SERIAL_ECHO_START();
-						SERIAL_ECHO("WIFI: ");
-						SERIAL_ECHOLN((char*)str);
+					// Validate SSID length before access
+					if(packet->data[8] > 0 && packet->data[8] < 100){
+						// Check if we have enough data for SSID
+						if(packet->dataLen >= (9 + packet->data[8])) {
+							memcpy(str,&packet->data[9],packet->data[8]); 
+							str[packet->data[8]]=0;
+							SERIAL_ECHO_START();
+							SERIAL_ECHO("WIFI: ");
+							SERIAL_ECHOLN((char*)str);
+						}
 					}else{
-						DEBUG("Network NAME too long");
+						DEBUG("Network NAME invalid length: %d", packet->data[8]);
 					}
 				}
-//				DEBUG("[Net] connected, IP: %d.%d.%d.%d",packet->data[0],packet->data[1],packet->data[2],packet->data[3]);
 			}else if(packet->data[6] == ESP_NET_WIFI_EXCEPTION){
-				DEBUG("[Net] wifi exeption");
+				DEBUG("[Net] wifi exception");
 			}else{
-				DEBUG("[Net] wifi not config");
+				DEBUG("[Net] wifi not configured");
 			}
+			
 			mks_wifi_info.connected = (packet->data[6] == 0x0A);
 			memcpy(&(mks_wifi_info.ip), &(packet->data[0]), 4);
 			mks_wifi_info.mode = packet->data[7];
-			if (packet->data[8] < 32)
-				strncpy(mks_wifi_info.net_name, (char*)&(packet->data[9]), packet->data[8]);
-			else
-				strncpy(mks_wifi_info.net_name, (char*)&(packet->data[9]), 31);
+			
+			// Safe SSID copy with length validation
+			uint8_t ssid_len = packet->data[8];
+			if (ssid_len > 0 && ssid_len < 32) {
+				// Verify we have enough data in packet
+				if (packet->dataLen >= (9 + ssid_len)) {
+					strncpy(mks_wifi_info.net_name, (char*)&(packet->data[9]), ssid_len);
+					mks_wifi_info.net_name[ssid_len] = '\0';
+				} else {
+					DEBUG("[NET] Not enough data for SSID: have %d, need %d", packet->dataLen, 9 + ssid_len);
+					memset(mks_wifi_info.net_name, 0, 32);
+				}
+			} else {
+				memset(mks_wifi_info.net_name, 0, 32);
+			}
+			
+			// Update WiFi state based on connection status
+			if (mks_wifi_info.connected) {
+				if (mks_wifi_info.state == WIFI_STATE_CONNECTING) {
+					mks_wifi_info.state = WIFI_STATE_CONNECTED;
+					mks_wifi_info.connecting_start_time = 0;
+					DEBUG("[NET] WiFi connected successfully");
+				}
+			} else {
+				if (mks_wifi_info.state == WIFI_STATE_CONNECTING) {
+					// Still connecting, will timeout if no response
+				} else if (mks_wifi_info.state == WIFI_STATE_CONNECTED) {
+					// Was connected, now disconnected
+					mks_wifi_info.state = WIFI_STATE_IDLE;
+				}
+			}
 			break;
+		}
 		case ESP_TYPE_GCODE:
 				char gcode_cmd[50];
 				uint32_t cmd_index;
@@ -342,9 +381,55 @@ void mks_wifi_parse_packet(ESP_PROTOC_FRAME *packet){
 		case ESP_TYPE_FILE_FRAGMENT:
 				DEBUG("[FILE_FRAGMENT]");
 			break;
-		case ESP_TYPE_WIFI_LIST:
-			DEBUG("[WIFI_LIST]");
+		case ESP_TYPE_WIFI_LIST: {
+			// Parse WiFi network list from ESP
+			// Format: [count(1)] [ [ssid_len(1)] [ssid(len)] [rssi(1)] ] ...
+			if (packet->dataLen < 1) break;
+			
+			uint8_t network_count = packet->data[0];
+			if (network_count > WIFI_MAX_SCAN_NETWORKS) 
+				network_count = WIFI_MAX_SCAN_NETWORKS;
+			
+			mks_wifi_info.scan_count = 0;
+			uint16_t data_index = 1;
+			
+			for (uint8_t i = 0; i < network_count && data_index < packet->dataLen; i++) {
+				uint8_t ssid_len = packet->data[data_index++];
+				
+				// Validate SSID length
+				if (ssid_len == 0 || ssid_len > WIFI_SSID_MAX_LEN - 1) {
+					data_index += ssid_len;
+					if (data_index < packet->dataLen) data_index++; // Skip RSSI
+					continue;
+				}
+				
+				// Check if there's enough data for SSID + RSSI
+				if (data_index + ssid_len + 1 > packet->dataLen) break;
+				
+				// Copy SSID
+				memset(mks_wifi_info.scan_results[mks_wifi_info.scan_count].ssid, 0, WIFI_SSID_MAX_LEN);
+				memcpy(mks_wifi_info.scan_results[mks_wifi_info.scan_count].ssid, 
+					   &packet->data[data_index], ssid_len);
+				data_index += ssid_len;
+				
+				// Copy RSSI (signal strength)
+				mks_wifi_info.scan_results[mks_wifi_info.scan_count].rssi = (int8_t)packet->data[data_index++];
+				mks_wifi_info.scan_results[mks_wifi_info.scan_count].auth_mode = 0; // Not used for now
+				
+				mks_wifi_info.scan_count++;
+				
+				DEBUG("[WIFI_SCAN] SSID: %s, RSSI: %d", 
+					  mks_wifi_info.scan_results[mks_wifi_info.scan_count - 1].ssid,
+					  mks_wifi_info.scan_results[mks_wifi_info.scan_count - 1].rssi);
+			}
+			
+			mks_wifi_info.state = WIFI_STATE_SCAN_DONE;
+			mks_wifi_info.scanning_in_progress = 0;
+			mks_wifi_info.scan_results_updated = 1;
+			
+			DEBUG("[WIFI_LIST] Parsed %d networks", mks_wifi_info.scan_count);
 			break;
+		}
 		default:
 			DEBUG("[Unkn]");
 		 	break;
@@ -441,23 +526,23 @@ uint8_t mks_wifi_get_mode(void) {
 }
 
 void mks_wifi_request_scan(void) {
-	uint32_t packet_size;
-	ESP_PROTOC_FRAME esp_frame;
+	// Send scan request command directly (without packet framing)
+	// Command format: { 0xA5, 0x07, 0x00, 0x00, 0xFC }
+	static const uint8_t cmd_wifi_list[] = { 0xA5, 0x07, 0x00, 0x00, 0xFC };
 	
-	// Prepare scan request frame (type: request scan)
-	// Command format: type=0x05 (custom scan request)
-	mks_out_buffer[0] = 0x05; // Scan request command
-	
-	esp_frame.type = ESP_TYPE_NET; // Use NET type for control commands
-	esp_frame.dataLen = 1;
-	esp_frame.data = mks_out_buffer;
-	packet_size = mks_wifi_build_packet((uint8_t *)esp_packet, &esp_frame);
-	
-	if (packet_size > 0) {
-		mks_wifi_send((uint8_t *)esp_packet, packet_size);
-		mks_wifi_info.state = WIFI_STATE_SCANNING;
-		DEBUG("WiFi scan requested");
+	// Send command directly via serial
+	for (uint8_t i = 0; i < sizeof(cmd_wifi_list); i++) {
+		while (MYSERIAL2.availableForWrite() == 0) {
+			safe_delay(1);
+		}
+		MYSERIAL2.write(cmd_wifi_list[i]);
 	}
+	
+	mks_wifi_info.state = WIFI_STATE_SCANNING;
+	mks_wifi_info.scanning_in_progress = 1;
+	mks_wifi_info.scan_count = 0;
+	mks_wifi_info.scan_results_updated = 0;
+	DEBUG("WiFi scan requested");
 }
 
 bool mks_wifi_has_scan_results(void) {
@@ -543,7 +628,7 @@ void mks_wifi_connect(void) {
 	if (packet_size > 0) {
 		mks_wifi_send((uint8_t *)esp_packet, packet_size);
 		mks_wifi_info.state = WIFI_STATE_CONNECTING;
-		mks_wifi_info.connecting_timeout = 30; // 30 second timeout
+		mks_wifi_info.connecting_start_time = millis();
 		DEBUG("WiFi connect requested for SSID: %s", mks_wifi_info.ssid_buf);
 	}
 }
@@ -563,7 +648,7 @@ void mks_wifi_reconnect(void) {
 	if (packet_size > 0) {
 		mks_wifi_send((uint8_t *)esp_packet, packet_size);
 		mks_wifi_info.state = WIFI_STATE_CONNECTING;
-		mks_wifi_info.connecting_timeout = 30;
+		mks_wifi_info.connecting_start_time = millis();
 		DEBUG("WiFi reconnect requested");
 	}
 }
@@ -572,16 +657,42 @@ void mks_wifi_reconnect(void) {
 // Main loop handler for Wi-Fi
 //
 void wifi_looping(void) {
-	// Handle Wi-Fi state transitions and timeouts
-	if (mks_wifi_info.state == WIFI_STATE_CONNECTING && mks_wifi_info.connecting_timeout > 0) {
-		mks_wifi_info.connecting_timeout--;
-		if (mks_wifi_info.connecting_timeout == 0) {
-			// Connection timeout - check status
-			DEBUG("WiFi connection timeout");
+	// Handle connection timeout using real time (milliseconds)
+	if (mks_wifi_info.state == WIFI_STATE_CONNECTING && mks_wifi_info.connecting_start_time > 0) {
+		uint32_t elapsed = millis() - mks_wifi_info.connecting_start_time;
+		
+		// 30 second timeout
+		if (elapsed > 30000) {
+			mks_wifi_info.state = WIFI_STATE_CONNECT_FAILED;
+			mks_wifi_info.connecting_start_time = 0;
+			DEBUG("[WIFI] Connection timeout - FAILED (elapsed: %lu ms)", elapsed);
+		} else if (elapsed % 5000 == 0) {
+			// Log every 5 seconds for debugging
+			DEBUG("[WIFI] Connecting... elapsed: %lu ms / 30000 ms", elapsed);
 		}
 	}
 	
-	// Additional Wi-Fi processing can be added here
-	// For now, this is a placeholder for future enhancements
+	// Handle scanning completion (keep state until results arrive)
+	if (mks_wifi_info.state == WIFI_STATE_SCANNING) {
+		// Scanning state is maintained by ESP_TYPE_WIFI_LIST handler
+	}
 }
 
+//
+// Consolidated API for setting both SSID and password at once
+//
+void mks_wifi_set_credentials(const char *ssid, const char *password) {
+	if (ssid) {
+		strncpy(mks_wifi_info.ssid_buf, ssid, WIFI_SSID_MAX_LEN - 1);
+		mks_wifi_info.ssid_buf[WIFI_SSID_MAX_LEN - 1] = '\0';
+		DEBUG("Credentials: SSID set to %s", mks_wifi_info.ssid_buf);
+	}
+	
+	if (password) {
+		strncpy(mks_wifi_info.pass_buf, password, WIFI_PASS_MAX_LEN - 1);
+		mks_wifi_info.pass_buf[WIFI_PASS_MAX_LEN - 1] = '\0';
+		DEBUG("Credentials: Password set (length: %d)", strlen(mks_wifi_info.pass_buf));
+	}
+	
+	mks_wifi_info.connect_needed = 1;
+}
